@@ -121,19 +121,20 @@ def partition_ffd_new(tasks, m):
 
 def make_inflated_view(task, alpha):
     v = dict(task)
-    v["u_LO"] = task["u_LO"] * (1.0 + alpha)
-    v["c_LO"] = task["c_LO"] * (1.0 + alpha)
+    base_u = task.get("orig_u_LO", task["u_LO"])
+    base_c = task.get("orig_c_LO", task["c_LO"])
+    v["u_LO"] = base_u * (1.0 + alpha)
+    v["c_LO"] = base_c * (1.0 + alpha)
     return v
 
 def _degrade(p, task, deg_ref):
-    n = 0
-    jobs = [j for j in p.ready_queue if j["task"]["id"] == task["id"]]
-    p.ready_queue[:] = [j for j in p.ready_queue if j["task"]["id"] != task["id"]]
-    n += len(jobs)
+    # Mark all currently-pending/running jobs of this task as degraded.
+    # Counting is done once-per-job at job exit (see run loop), NOT here.
+    for j in p.ready_queue:
+        if j["task"]["id"] == task["id"]:
+            j["degraded"] = True
     if p.running_job and p.running_job["task"]["id"] == task["id"]:
-        n += 1
-        p.running_job = None
-    deg_ref[0] += n
+        p.running_job["degraded"] = True
 
 def run_simulation(base_tasks, m, sim_ticks, mig_mode, switch_prob=0.20, mig_alpha=0.0):
     runtime_tasks = copy.deepcopy(base_tasks)
@@ -151,30 +152,48 @@ def run_simulation(base_tasks, m, sim_ticks, mig_mode, switch_prob=0.20, mig_alp
 
     total_jobs = 0
     deg_ref = [0]
+    lc_total = [0]
 
     for tick in range(sim_ticks):
         # 1. Job Release
         for t in runtime_tasks:
             if tick % t["period"] == 0:
                 total_jobs += 1
+                ms = (random.random() < switch_prob) if t["crit"] == "HC" else False
                 job = {"task": t, "id": total_jobs, "deadline": tick + t["period"],
-                       "rem_LO": t["c_LO"], "rem_HI": t["c_HI"], "started": False}
-                if t["crit"] == "LC" and t["current_proc"].mode == "HI":
-                    deg_ref[0] += 1
-                else:
-                    t["current_proc"].ready_queue.append(job)
+                       "rem_LO": t["c_LO"], "rem_HI": t["c_HI"], "started": False,
+                       "do_switch": ms}
+                if t["crit"] == "LC":
+                    lc_total[0] += 1
+                    if t["current_proc"].mode == "HI":
+                        job["degraded"] = True
+                t["current_proc"].ready_queue.append(job)
 
         # 2. 스케줄링
         for p in procs:
             if p.running_job:
-                if (p.mode == "LO" and p.running_job["rem_LO"] <= 0) or \
-                   (p.mode == "HI" and p.running_job["rem_HI"] <= 0):
+                jb = p.running_job
+                done = (jb["rem_HI"] <= 0) if jb.get("degraded", False) else \
+                       (jb["rem_LO"] <= 0 if p.mode == "LO" else jb["rem_HI"] <= 0)
+                if done:
+                    if jb["task"]["crit"] == "LC" and jb.get("degraded", False):
+                        deg_ref[0] += 1
+                        jb["_counted"] = True
                     p.running_job = None
 
             # Recovery: idle -> LO
             if p.running_job is None and len(p.ready_queue) == 0 and p.mode == "HI":
                 p.mode = "LO"
-                
+
+                # NoRec: task는 잔류하되, 호스트 코어가 idle->LO 복귀하면
+                # 그 코어에 머무는 migrated task의 1회 제한을 해제하여
+                # 이후 mode switch 때 다시 migrate 가능하게 한다.
+                if mig_mode == "mig_norec":
+                    for t in runtime_tasks:
+                        if t["crit"] == "LC" and t["current_proc"] == p \
+                           and t["migrated_once"]:
+                            t["migrated_once"] = False
+
                 # mig_rec 모드일 때만 원래 코어로 복귀시킴
                 if mig_mode == "mig_rec":
                     for t in runtime_tasks:
@@ -186,12 +205,12 @@ def run_simulation(base_tasks, m, sim_ticks, mig_mode, switch_prob=0.20, mig_alp
                             t["migrated_once"] = False
                             p.add(t)
                             t["current_proc"] = p
-                            
+
                             # [버그 수정] 임시 코어에 남아있던 Job들을 싹 회수해옴
                             mv = [j for j in old_p.ready_queue if j["task"]["id"] == t["id"]]
                             old_p.ready_queue = [j for j in old_p.ready_queue if j["task"]["id"] != t["id"]]
                             p.ready_queue.extend(mv)
-                            
+
                             if old_p.running_job and old_p.running_job["task"]["id"] == t["id"]:
                                 p.ready_queue.append(old_p.running_job)
                                 old_p.running_job = None
@@ -203,7 +222,7 @@ def run_simulation(base_tasks, m, sim_ticks, mig_mode, switch_prob=0.20, mig_alp
                 if not p.running_job["started"]:
                     p.running_job["started"] = True
                     if p.running_job["task"]["crit"] == "HC" and p.mode == "LO":
-                        if random.random() < switch_prob:
+                        if p.running_job.get("do_switch", False):
                             p.mode = "HI"
 
                             candidates = sorted(
@@ -219,34 +238,66 @@ def run_simulation(base_tasks, m, sim_ticks, mig_mode, switch_prob=0.20, mig_alp
 
                                 # 마이그레이션 시도 (mig_rec, mig_norec 공통)
                                 migrated = False
+                                # Admission Test: 마이그레이션 직후의 일회성 오버헤드를
+                                # 감당할 수 있는지 보수적으로 검사
                                 check = make_inflated_view(lc, mig_alpha) if mig_alpha > 0.0 else lc
 
                                 for tp in procs:
                                     if tp != p and tp.mode == "LO" and tp.try_add(check):
                                         p.remove(lc)
-                                        if mig_alpha > 0.0:
-                                            lc["u_LO"] = lc["orig_u_LO"] * (1.0 + mig_alpha)
-                                            lc["c_LO"] = lc["orig_c_LO"] * (1.0 + mig_alpha)
+
+                                        # [버그 수정 핵심]
+                                        # 마이그레이션 타겟 코어에 태스크를 추가할 때,
+                                        # u_LO와 c_LO를 영구적으로 부풀리지 않음.
+                                        # 새 코어에 정착한 이후 새로 릴리즈되는 Job들은
+                                        # 캐시 워밍 페널티가 없어야 함.
+                                        lc["u_LO"] = lc["orig_u_LO"]
+                                        lc["c_LO"] = lc["orig_c_LO"]
+
                                         tp.add(lc)
                                         lc["current_proc"] = tp
-                                        lc["migrated_once"] = True 
+                                        lc["migrated_once"] = True
 
+                                        # 기존 코어에 있던 Pending Job들을 회수
                                         mv = [j for j in p.ready_queue if j["task"]["id"] == lc["id"]]
                                         p.ready_queue = [j for j in p.ready_queue if j["task"]["id"] != lc["id"]]
+
+                                        # 현재 실행 중이거나 대기 중이던 Job이 이사갈 때만
+                                        # 일회성 물리 오버헤드 부여
                                         if mig_alpha > 0.0:
-                                            for j in mv: j["rem_LO"] += lc["orig_c_LO"] * mig_alpha
+                                            for j in mv:
+                                                if j["rem_LO"] > 0:
+                                                    j["rem_LO"] += j["rem_LO"] * mig_alpha
+
                                         tp.ready_queue.extend(mv)
                                         migrated = True
                                         break
-                                
+
                                 if not migrated:
                                     _degrade(p, lc, deg_ref)
 
             if p.running_job:
-                if p.mode == "LO": p.running_job["rem_LO"] -= 1
-                else: p.running_job["rem_HI"] -= 1
+                if p.running_job.get("degraded", False):
+                    p.running_job["rem_HI"] -= 1
+                elif p.mode == "LO":
+                    p.running_job["rem_LO"] -= 1
+                else:
+                    p.running_job["rem_HI"] -= 1
 
-    return total_jobs, deg_ref[0]
+    # 시뮬레이션 종료 시점에 아직 큐/실행 중이던 degraded LC job 중
+    # 아직 카운트되지 않은 것을 1회씩 집계
+    for p in procs:
+        for j in p.ready_queue:
+            if j["task"]["crit"] == "LC" and j.get("degraded", False) \
+               and not j.get("_counted", False):
+                deg_ref[0] += 1
+                j["_counted"] = True
+        if p.running_job and p.running_job["task"]["crit"] == "LC" \
+           and p.running_job.get("degraded", False) \
+           and not p.running_job.get("_counted", False):
+            deg_ref[0] += 1
+
+    return lc_total[0], deg_ref[0]
 
 def prepare_sets(all_tasks, m, max_sets):
     prepared = []
