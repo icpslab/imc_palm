@@ -53,6 +53,23 @@ def is_schedulable_new(U_LC_A, U_HC_L, U_LC_D, U_HC_H, hc_tasks, lc_tasks):
         else: lo_sum += u_l / x
     return lo_sum <= 1.0
 
+def is_schedulable_fixed_x(x_star, U_LC_A, U_LC_D, U_HC_H, hc_tasks):
+    """Schedulability test at a fixed offline coefficient x_star.
+
+    Used by the runtime migration admission check; does NOT recompute x_max.
+    """
+    if x_star is None or x_star <= 0.0:
+        return False
+    if x_star * U_LC_A + (1.0 - x_star) * U_LC_D + U_HC_H > 1.0:
+        return False
+    lo_sum = U_LC_A
+    for (u_l, u_h) in hc_tasks:
+        if u_l / x_star >= u_h:
+            lo_sum += u_h
+        else:
+            lo_sum += u_l / x_star
+    return lo_sum <= 1.0
+
 class Processor:
     def __init__(self, proc_id, sched_func):
         self.id = proc_id
@@ -67,6 +84,7 @@ class Processor:
         self.mode = "LO"
         self.ready_queue = []
         self.running_job = None
+        self.x_star = None
 
     def try_add(self, task: dict) -> bool:
         if task["crit"] == "HC":
@@ -82,6 +100,23 @@ class Processor:
             new_hc = self.hc_tasks
             new_lc = self.lc_tasks + [(task["u_LO"], task["u_HI"])]
         return self._sched_func(new_U_LC_A, new_U_HC_L, new_U_LC_D, new_U_HC_H, new_hc, new_lc)
+
+    def try_add_fixed_x(self, task: dict) -> bool:
+        """Runtime migration admission test at this processor's offline-frozen x_star."""
+        if self.x_star is None:
+            return False
+        if task["crit"] == "HC":
+            new_U_LC_A, new_U_LC_D = self.U_LC_A, self.U_LC_D
+            new_U_HC_H = self.U_HC_H + task["u_HI"]
+            new_hc = self.hc_tasks + [(task["u_LO"], task["u_HI"])]
+        else:
+            new_U_LC_A = self.U_LC_A + task["u_LO"]
+            new_U_LC_D = self.U_LC_D + task["u_HI"]
+            new_U_HC_H = self.U_HC_H
+            new_hc = self.hc_tasks
+        return is_schedulable_fixed_x(
+            self.x_star, new_U_LC_A, new_U_LC_D, new_U_HC_H, new_hc
+        )
 
     def add(self, task: dict):
         if task["crit"] == "HC":
@@ -117,6 +152,9 @@ def partition_ffd_new(tasks, m):
                 break
         if not placed:
             return None
+            
+    for p in procs:
+        p.x_star = compute_x_max(p.U_LC_A, p.U_LC_D, p.U_HC_H)
     return procs
 
 def make_inflated_view(task, alpha):
@@ -128,8 +166,6 @@ def make_inflated_view(task, alpha):
     return v
 
 def _degrade(p, task, deg_ref):
-    # Mark all currently-pending/running jobs of this task as degraded.
-    # Counting is done once-per-job at job exit (see run loop), NOT here.
     for j in p.ready_queue:
         if j["task"]["id"] == task["id"]:
             j["degraded"] = True
@@ -155,7 +191,6 @@ def run_simulation(base_tasks, m, sim_ticks, mig_mode, switch_prob=0.20, mig_alp
     lc_total = [0]
 
     for tick in range(sim_ticks):
-        # 1. Job Release
         for t in runtime_tasks:
             if tick % t["period"] == 0:
                 total_jobs += 1
@@ -169,7 +204,6 @@ def run_simulation(base_tasks, m, sim_ticks, mig_mode, switch_prob=0.20, mig_alp
                         job["degraded"] = True
                 t["current_proc"].ready_queue.append(job)
 
-        # 2. 스케줄링
         for p in procs:
             if p.running_job:
                 jb = p.running_job
@@ -181,20 +215,15 @@ def run_simulation(base_tasks, m, sim_ticks, mig_mode, switch_prob=0.20, mig_alp
                         jb["_counted"] = True
                     p.running_job = None
 
-            # Recovery: idle -> LO
             if p.running_job is None and len(p.ready_queue) == 0 and p.mode == "HI":
                 p.mode = "LO"
 
-                # NoRec: task는 잔류하되, 호스트 코어가 idle->LO 복귀하면
-                # 그 코어에 머무는 migrated task의 1회 제한을 해제하여
-                # 이후 mode switch 때 다시 migrate 가능하게 한다.
                 if mig_mode == "mig_norec":
                     for t in runtime_tasks:
                         if t["crit"] == "LC" and t["current_proc"] == p \
                            and t["migrated_once"]:
                             t["migrated_once"] = False
 
-                # mig_rec 모드일 때만 원래 코어로 복귀시킴
                 if mig_mode == "mig_rec":
                     for t in runtime_tasks:
                         if t["home_proc"] == p and t["current_proc"] != p:
@@ -206,7 +235,6 @@ def run_simulation(base_tasks, m, sim_ticks, mig_mode, switch_prob=0.20, mig_alp
                             p.add(t)
                             t["current_proc"] = p
 
-                            # [버그 수정] 임시 코어에 남아있던 Job들을 싹 회수해옴
                             mv = [j for j in old_p.ready_queue if j["task"]["id"] == t["id"]]
                             old_p.ready_queue = [j for j in old_p.ready_queue if j["task"]["id"] != t["id"]]
                             p.ready_queue.extend(mv)
@@ -231,26 +259,18 @@ def run_simulation(base_tasks, m, sim_ticks, mig_mode, switch_prob=0.20, mig_alp
                             )
 
                             for lc in candidates:
-                                # off 모드거나, 이미 1번 마이그레이션 한 상태면 즉시 degrade
                                 if mig_mode == "off" or lc["migrated_once"]:
                                     _degrade(p, lc, deg_ref)
                                     continue
 
-                                # 마이그레이션 시도 (mig_rec, mig_norec 공통)
                                 migrated = False
-                                # Admission Test: 마이그레이션 직후의 일회성 오버헤드를
-                                # 감당할 수 있는지 보수적으로 검사
                                 check = make_inflated_view(lc, mig_alpha) if mig_alpha > 0.0 else lc
 
                                 for tp in procs:
-                                    if tp != p and tp.mode == "LO" and tp.try_add(check):
+                                    # 이 부분이 수정되었습니다: try_add가 아닌 try_add_fixed_x 사용
+                                    if tp != p and tp.mode == "LO" and tp.try_add_fixed_x(check):
                                         p.remove(lc)
 
-                                        # [버그 수정 핵심]
-                                        # 마이그레이션 타겟 코어에 태스크를 추가할 때,
-                                        # u_LO와 c_LO를 영구적으로 부풀리지 않음.
-                                        # 새 코어에 정착한 이후 새로 릴리즈되는 Job들은
-                                        # 캐시 워밍 페널티가 없어야 함.
                                         lc["u_LO"] = lc["orig_u_LO"]
                                         lc["c_LO"] = lc["orig_c_LO"]
 
@@ -258,12 +278,9 @@ def run_simulation(base_tasks, m, sim_ticks, mig_mode, switch_prob=0.20, mig_alp
                                         lc["current_proc"] = tp
                                         lc["migrated_once"] = True
 
-                                        # 기존 코어에 있던 Pending Job들을 회수
                                         mv = [j for j in p.ready_queue if j["task"]["id"] == lc["id"]]
                                         p.ready_queue = [j for j in p.ready_queue if j["task"]["id"] != lc["id"]]
 
-                                        # 현재 실행 중이거나 대기 중이던 Job이 이사갈 때만
-                                        # 일회성 물리 오버헤드 부여
                                         if mig_alpha > 0.0:
                                             for j in mv:
                                                 if j["rem_LO"] > 0:
@@ -284,8 +301,6 @@ def run_simulation(base_tasks, m, sim_ticks, mig_mode, switch_prob=0.20, mig_alp
                 else:
                     p.running_job["rem_HI"] -= 1
 
-    # 시뮬레이션 종료 시점에 아직 큐/실행 중이던 degraded LC job 중
-    # 아직 카운트되지 않은 것을 1회씩 집계
     for p in procs:
         for j in p.ready_queue:
             if j["task"]["crit"] == "LC" and j.get("degraded", False) \
